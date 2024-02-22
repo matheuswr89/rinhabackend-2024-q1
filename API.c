@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <netinet/in.h>
+#include <math.h>
 #include <postgresql/libpq-fe.h>
 #include "cjson/cJSON.h"
 
@@ -13,8 +14,8 @@
 
 PGconn *conn = NULL;
 
-const char *select_client = "SELECT c.saldo, c.limite, (timezone('America/Sao_Paulo', now())) FROM cliente c WHERE c.id = $1 ";
-const char *update_client = "UPDATE cliente SET saldo=$1 WHERE id=$2";
+const char *select_client = "SELECT c.saldo, c.limite, (timezone('America/Sao_Paulo', now())) FROM cliente c WHERE c.id = $1";
+const char *update_client = "UPDATE cliente SET saldo = (saldo + $1) WHERE id = $2 AND (saldo + $1) > (-limite) RETURNING saldo, limite";
 const char *insert_trancacao = "INSERT INTO transacao (cliente_id, valor, descricao, tipo, realizada_em) VALUES ($1, $2, $3, $4, (timezone('America/Sao_Paulo', now())))";
 const char *select_transacao = "SELECT t.valor, t.tipo, t.descricao, t.realizada_em FROM transacao t WHERE t.cliente_id = $1 ORDER BY t.realizada_em DESC LIMIT 10";
 
@@ -55,6 +56,15 @@ void error_query(PGresult *res, int client_socket) {
     close(client_socket);
 }
 
+PGresult* execute_params(const int client_socket, const char* query, const char *params[], int size) {
+    PGresult *res = PQexecParams(conn, query, size, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        error_query(res, client_socket);
+        return NULL;
+    }
+    return res; 
+}
+
 void handle_post_transacoes(int client_socket, const char id[20], int valor, const char* tipo, const char* descricao) {
     if (valor <= 0) {
         return_response_fail(client_socket, "Invalid valor (must be a positive integer)", 422, "Unprocessable Entity");
@@ -71,64 +81,40 @@ void handle_post_transacoes(int client_socket, const char id[20], int valor, con
         return;
     }
 
-    PGresult *res = PQexecParams(conn, select_client, 1, NULL, (const char *[]){id}, NULL, NULL, 0);
-
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        error_query(res, client_socket);
+    
+    int novoValor = tolower(tipo[0]) == 'c' ? valor : valor * -1;
+    char buffer[100]; 
+    snprintf(buffer, sizeof(buffer), "%d", novoValor);
+    
+    PGresult *res = PQexecParams(conn, update_client, 2, NULL, (const char *[]){buffer, id}, NULL, NULL, 0);
+    if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1) {
+        // Verificar se a consulta UPDATE foi bem-sucedida e retornou uma única linha
+        return_response_fail(client_socket, "Transação rejeitada", 422, "Unprocessable Entity");
+        PQclear(res);
         return;
     }
-    int saldo = atoi(PQgetvalue(res, 0, 0));
-    int limite = atoi(PQgetvalue(res, 0, 1));
+    int novo_saldo = atoi(PQgetvalue(res, 0, 0));
+    int novo_limite = atoi(PQgetvalue(res, 0, 1));
     PQclear(res);
 
-    if (tolower(tipo[0]) == 'c') {
-        saldo += valor;
-    } else if (tolower(tipo[0]) == 'd') {
-        saldo -= valor;
-        if (saldo <= (limite * -1)) {
-            return_response_fail(client_socket, "Transaction rejected", 422, "Unprocessable Entity");
-            return;
-        }
-    }
-
-    char buffer[10]; 
-    snprintf(buffer, sizeof(buffer), "%d", saldo);
-    res = PQexecParams(conn, update_client, 2, NULL, (const char *[]){buffer, id}, NULL, NULL, 0);
-
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        error_query(res, client_socket);
-        return;
-    }
-    PQclear(res);
-
-    char bufferValor[10]; 
+    char bufferValor[100]; 
     snprintf(bufferValor, sizeof(bufferValor), "%d", valor);
     res = PQexecParams(conn, insert_trancacao, 4, NULL, (const char *[]){id, bufferValor, descricao, tipo}, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        error_query(res, client_socket);
-        return;
-    }
-
-    char json_response[BUFFER_SIZE];
-    snprintf(json_response, BUFFER_SIZE, "{\n  \"limite\": %d, \"saldo\": %d}", limite, saldo);
     PQclear(res);
+    
+    char json_response[BUFFER_SIZE];
+    snprintf(json_response, BUFFER_SIZE, "{\n  \"limite\": %d, \"saldo\": %d}", novo_limite, novo_saldo);
     return_response_ok(client_socket, json_response);
 }
 
 void handle_get_extrato(int client_socket, char* id) {
-    PGresult *res = PQexecParams(conn, select_client, 1, NULL, (const char *[]){id}, NULL, NULL, 0);
-    
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        error_query(res, client_socket);
-        return;
-    }
-
+    PGresult *res = execute_params(client_socket, select_client, (const char *[]){id}, 1);
     char json_response[BUFFER_SIZE];
     snprintf(json_response, BUFFER_SIZE, "{\n  \"saldo\": {\n    \"total\": %s,\n   \"data_extrato\": \"%s\",\n   \"limite\": %s\n  },\n    \"ultimas_transacoes\": [",
              PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 2), PQgetvalue(res, 0, 1));
 
     PQclear(res);
-    res = PQexecParams(conn, select_transacao, 1, NULL, (const char *[]){id}, NULL, NULL, 0);
+    res = execute_params(client_socket, select_transacao, (const char *[]){id}, 1);
     int num_rows = PQntuples(res);
     for (int i = 0; i < num_rows; i++) {
         if (PQgetvalue(res, i, 1) != NULL && strlen(PQgetvalue(res, i, 1)) > 0) {
